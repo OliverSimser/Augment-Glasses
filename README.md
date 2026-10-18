@@ -26,7 +26,8 @@ IMA ADPCM (64 kbps), and streams it to the iPhone app over BLE. Once a second, t
 Serial Monitor (115200 baud) shows the RMS and peak level in dBFS, frames per second
 (should be 50), clipped samples, dropped frames, and the BLE state (`waiting`,
 `connected`, or `streaming`) with packets sent per second. Adjust `MIC_GAIN_DB` until
-speech peaks reach about -12 to -6 dBFS without clipping (24 dB tested well).
+speech peaks reach about -12 to -6 dBFS without clipping (22 dB; 24 dB clipped on
+close, loud speech).
 
 Captions sent back by the phone are printed as `[CAPTION] ...` lines. Display output
 is not implemented yet.
@@ -38,7 +39,8 @@ No WiFi is used. Everything goes over BLE:
 1. The ESP32 advertises as `AugmentGlasses` and streams compressed audio.
 2. The iPhone app connects, decodes the audio, and transcribes it with Apple's
    on-device speech-to-text (`SpeechAnalyzer`, iOS 26). No audio leaves the phone,
-   and it works without cell data after the one-time model download.
+   and it works without cell data after the one-time model download. (A cloud
+   speech service may be more accurate, at the cost of needing data; not planned yet.)
 3. The app writes the latest caption text back to the ESP32 about 10 times a second.
 
 ## iPhone app
@@ -70,7 +72,9 @@ installs expire after 7 days and must be reinstalled from Xcode.
    This is done in Xcode, before the app is installed. iOS shows the text in the
    permission pop-ups and closes the app if a key is missing.
 6. On **Signing & Capabilities**, choose your **Team** (sign in with your Apple ID).
-7. Plug in the iPhone, pick it in the run-destination menu at the top of the window
+7. Optional app icon: open **Assets** in the project navigator, click **AppIcon**, and
+   drag [`iOS/AppIcon-1024.png`](iOS/AppIcon-1024.png) onto the **Any Appearance** slot.
+8. Plug in the iPhone, pick it in the run-destination menu at the top of the window
    (it must say your iPhone's name, not **My Mac**), and press **Run**. The
    first time, enable **Settings > Privacy & Security > Developer Mode** on the
    iPhone, and trust your developer certificate under **Settings > General > VPN &

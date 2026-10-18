@@ -54,7 +54,7 @@ const size_t QUEUE_FRAMES = 25;                              // 500 ms of slack 
 
 // The INMP441 is quiet: conversation at 1 m (~60 dB SPL) lands near -60 dBFS at
 // unity gain. Tune with the level log so speech peaks sit around -12 to -6 dBFS.
-const float MIC_GAIN_DB = 24.0f;
+const float MIC_GAIN_DB = 22.0f;  // 24 dB clipped on close, loud speech
 
 // One-pole DC blocker. The INMP441 has a DC offset, and 0.98 also cuts rumble
 // below ~50 Hz, which carries no speech.
