@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 struct ContentView: View {
     let session: CaptionSession
@@ -30,9 +33,16 @@ struct ContentView: View {
                     .disabled(session.displayText.isEmpty)
             }
         }
-        // Keeps the app in the foreground while testing; see the README about background use.
-        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
-        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        .onAppear { keepScreenAwake(true) }
+        .onDisappear { keepScreenAwake(false) }
+    }
+
+    /// Keeps the app in the foreground while testing; see the README about background use.
+    /// UIApplication only exists on iPhone/iPad, so this does nothing if built for a Mac.
+    private func keepScreenAwake(_ on: Bool) {
+        #if os(iOS)
+        UIApplication.shared.isIdleTimerDisabled = on
+        #endif
     }
 
     private var statusPanel: some View {

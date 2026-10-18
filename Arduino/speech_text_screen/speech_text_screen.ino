@@ -4,9 +4,12 @@
 // caption text back, which is printed to Serial until the display is added.
 // No WiFi is used.
 //
-// Board: "ESP32 Dev Module". Serial Monitor at 115200.
-// Wiring (same as washer_bluer.ino):
-//   INMP441  SCK -> GPIO 26, WS -> GPIO 25, SD -> GPIO 33, L/R -> GND, VDD -> 3V3
+// Board: "ESP32 Dev Module" or "ESP32S3 Dev Module". Serial Monitor at 115200.
+// Wiring, INMP441 L/R -> GND, VDD -> 3V3, plus:
+//   ESP32     SCK -> GPIO 26, WS -> GPIO 25, SD -> GPIO 33 (same as washer_bluer.ino)
+//   ESP32-S3  SCK -> GPIO 4,  WS -> GPIO 5,  SD -> GPIO 6  (same as dryer_and_washer_bluer.ino)
+// On the S3, use the USB port marked UART/COM, or enable Tools > USB CDC On Boot to
+// get the Serial Monitor on the native USB port.
 //
 // BLE protocol (the iPhone app in ../../iOS must match):
 //   Service  4a8e0001-6c2b-4e5f-9a3d-1c7b2f0e8d10
@@ -22,16 +25,26 @@
 #include <freertos/queue.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
+// The classic ESP32 uses the Bluedroid BLE stack. The S3 uses NimBLE on Arduino-ESP32
+// core 3.3 and later (Bluedroid on 3.0-3.2); NimBLE adds the subscribe descriptor
+// itself and has different callback signatures.
+#if defined(CONFIG_BLUEDROID_ENABLED)
 #include <BLE2902.h>
-
-#if !CONFIG_IDF_TARGET_ESP32
-#error "Pins are for the original ESP32 (GPIO 26 and 33 do not exist on the ESP32-S3)"
 #endif
 
 // ---------------- Pins ----------------
+#if CONFIG_IDF_TARGET_ESP32
 #define I2S_SCK 26
 #define I2S_WS 25
 #define I2S_SD 33
+#elif CONFIG_IDF_TARGET_ESP32S3
+// GPIO 26-37 are taken by flash/PSRAM on most S3 modules, so the S3 uses low pins.
+#define I2S_SCK 4
+#define I2S_WS 5
+#define I2S_SD 6
+#else
+#error "Pins are only defined for the ESP32 and ESP32-S3"
+#endif
 
 // ---------------- Audio format ----------------
 const uint32_t SAMPLE_RATE = 16000;  // speech content is below 8 kHz; STT models run at 16 kHz
@@ -104,7 +117,11 @@ const size_t MAX_CAPTION_BYTES = MAX_ATT_MTU - 3 - 1;  // one ATT write, minus t
 
 BLEServer* bleServer = NULL;
 BLECharacteristic* audioChar = NULL;
+#if defined(CONFIG_BLUEDROID_ENABLED)
 BLE2902* audioCccd = NULL;
+#else
+volatile bool audioNotifying = false;  // set from NimBLE's onSubscribe
+#endif
 
 volatile bool bleConnected = false;
 volatile uint16_t peerMtu = DEFAULT_ATT_MTU;
@@ -308,32 +325,63 @@ uint8_t adpcmEncode(int16_t sample) {
 }
 
 // ---------------- BLE callbacks ----------------
+// 15-30 ms interval, inside Apple's accessory guidelines. 50 packets/s needs at
+// most two packets per connection event.
+const uint16_t CONN_MIN_INTERVAL = 12;  // x 1.25 ms
+const uint16_t CONN_MAX_INTERVAL = 24;
+const uint16_t CONN_TIMEOUT = 400;  // x 10 ms
+
+void onPhoneConnected() {
+  bleConnected = true;
+  Serial.println("[BLE] phone connected");
+}
+
+void onPhoneDisconnected() {
+  bleConnected = false;
+  peerMtu = DEFAULT_ATT_MTU;
+  // The phone re-subscribes after it reconnects. Bluedroid would otherwise keep
+  // the old subscription flag across connections.
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  if (audioCccd != NULL) audioCccd->setNotifications(false);
+#else
+  audioNotifying = false;
+#endif
+  Serial.println("[BLE] phone disconnected, advertising again");
+}
+
+void onMtu(uint16_t mtu) {
+  peerMtu = mtu;
+  Serial.printf("[BLE] MTU %u\n", (unsigned)mtu);
+}
+
 class ServerCallbacks : public BLEServerCallbacks {
   using BLEServerCallbacks::onConnect;
   using BLEServerCallbacks::onDisconnect;
   using BLEServerCallbacks::onMtuChanged;
 
+#if defined(CONFIG_BLUEDROID_ENABLED)
   void onConnect(BLEServer* server, esp_ble_gatts_cb_param_t* param) override {
-    bleConnected = true;
-    // 15-30 ms interval, inside Apple's accessory guidelines. 50 packets/s needs
-    // at most two packets per connection event.
-    server->requestConnParams(param->connect.remote_bda, 12, 24, 0, 400);
-    Serial.println("[BLE] phone connected");
+    onPhoneConnected();
+    server->requestConnParams(param->connect.remote_bda, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, 0, CONN_TIMEOUT);
   }
-
   void onDisconnect(BLEServer*, esp_ble_gatts_cb_param_t*) override {
-    bleConnected = false;
-    peerMtu = DEFAULT_ATT_MTU;
-    // Bluedroid keeps the old subscription flag across connections; the phone
-    // re-subscribes after it reconnects.
-    if (audioCccd != NULL) audioCccd->setNotifications(false);
-    Serial.println("[BLE] phone disconnected, advertising again");
+    onPhoneDisconnected();
   }
-
   void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
-    peerMtu = param->mtu.mtu;
-    Serial.printf("[BLE] MTU %u\n", (unsigned)param->mtu.mtu);
+    onMtu(param->mtu.mtu);
   }
+#else
+  void onConnect(BLEServer* server, ble_gap_conn_desc* desc) override {
+    onPhoneConnected();
+    server->requestConnParams(desc->conn_handle, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, 0, CONN_TIMEOUT);
+  }
+  void onDisconnect(BLEServer*, ble_gap_conn_desc*) override {
+    onPhoneDisconnected();
+  }
+  void onMtuChanged(BLEServer*, ble_gap_conn_desc*, uint16_t mtu) override {
+    onMtu(mtu);
+  }
+#endif
 };
 
 class AudioCallbacks : public BLECharacteristicCallbacks {
@@ -342,6 +390,12 @@ class AudioCallbacks : public BLECharacteristicCallbacks {
     if (s == Status::SUCCESS_NOTIFY) packetsThisSecond++;
     else if (s == Status::ERROR_GATT) notifyFailures++;
   }
+
+#if !defined(CONFIG_BLUEDROID_ENABLED)
+  void onSubscribe(BLECharacteristic*, ble_gap_conn_desc*, uint16_t subValue) override {
+    audioNotifying = (subValue & 0x0001) != 0;
+  }
+#endif
 };
 
 class CaptionCallbacks : public BLECharacteristicCallbacks {
@@ -376,8 +430,10 @@ void setupBle() {
   BLEService* service = bleServer->createService(SERVICE_UUID);
 
   audioChar = service->createCharacteristic(AUDIO_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+#if defined(CONFIG_BLUEDROID_ENABLED)
   audioCccd = new BLE2902();  // Bluedroid does not add the subscribe descriptor itself
   audioChar->addDescriptor(audioCccd);
+#endif
   audioChar->setCallbacks(new AudioCallbacks());
 
   BLECharacteristic* captionChar = service->createCharacteristic(
@@ -394,7 +450,11 @@ void setupBle() {
 }
 
 bool audioSubscribed() {
+#if defined(CONFIG_BLUEDROID_ENABLED)
   return bleConnected && audioCccd != NULL && audioCccd->getNotifications();
+#else
+  return bleConnected && audioNotifying;
+#endif
 }
 
 // Splits a frame into as few packets as the negotiated MTU allows (one per frame
@@ -519,8 +579,11 @@ void setup() {
 }
 
 void loop() {
+  // Frames arrive every 20 ms, so while audio flows this loop only exits for the
+  // level print. Captions are checked per frame so they show within 20 ms.
   while (xQueueReceive(audioQueue, &loopFrame, pdMS_TO_TICKS(50)) == pdTRUE) {
     handleAudioFrame(loopFrame);
+    showCaptionIfChanged();
     if (millis() - lastLevelPrint >= 1000) break;
   }
 
