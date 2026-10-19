@@ -4,22 +4,17 @@ See-through captioning glasses using virtual-image optics to display real-time s
 ## Arduino sketch
 
 Open [speech_text_screen.ino](Arduino/speech_text_screen/speech_text_screen.ino)
-in the Arduino IDE and select **ESP32 Dev Module** or **ESP32S3 Dev Module**. It
-needs the Arduino-ESP32 core 3.x (3.3 or later recommended); core 2.x will not compile
-it. The sketch is in a matching folder as required by the Arduino IDE.
+in the Arduino IDE and select **ESP32S3 Dev Module**.
 
 Wiring (INMP441 I2S microphone):
 
-| INMP441 | ESP32    | ESP32-S3 |
-|---------|----------|----------|
-| SCK     | GPIO 26  | GPIO 4   |
-| WS      | GPIO 25  | GPIO 5   |
-| SD      | GPIO 33  | GPIO 6   |
-| L/R     | GND      | GND      |
-| VDD     | 3V3      | 3V3      |
-
-On the S3, use the USB port marked UART/COM, or enable **Tools > USB CDC On Boot**
-to get the Serial Monitor on the native USB port.
+| INMP441 | ESP32-S3 |
+|---------|----------|
+| SCK     | GPIO 4   |
+| WS      | GPIO 5   |
+| SD      | GPIO 6   |
+| L/R     | GND      |
+| VDD     | 3V3      |
 
 The sketch captures 16 kHz, 16-bit mono PCM in 20 ms frames, compresses it 4:1 with
 IMA ADPCM (64 kbps), and streams it to the iPhone app over BLE. Once a second, the
@@ -34,7 +29,7 @@ is not implemented yet.
 
 ## How it works
 
-No WiFi is used. Everything goes over BLE:
+Everything goes over BLE:
 
 1. The ESP32 advertises as `AugmentGlasses` and streams compressed audio.
 2. The iPhone app connects, decodes the audio, and transcribes it with Apple's
@@ -82,12 +77,6 @@ installs expire after 7 days and must be reinstalled from Xcode.
 
 ### Build problems
 
-- **Cannot find 'UIApplication' in scope**, or other iOS-only errors: the run
-  destination is **My Mac**. Pick your iPhone (or an iPhone simulator) at the top of
-  the window. The simulator builds the app but has no Bluetooth, so test on the phone.
-- **Invalid redeclaration of 'ContentView'** or **'main' attribute can only apply to
-  one type**: the generated files from step 2 are still in the project. Delete the
-  old ones and rename any `… 2.swift` file to drop the ` 2`.
 - **The app expires after 7 days**: plug the phone in and press **Run** again. This
   re-signs it for another 7 days and keeps the app's data.
 
