@@ -19,16 +19,20 @@ Wiring (INMP441 I2S microphone):
 
 The sketch captures 16 kHz, 16-bit mono PCM in 20 ms frames and streams it to the
 iPhone app over BLE uncompressed (256 kbps), using the S3's faster 2M Bluetooth mode.
-Set `SEND_RAW_PCM` to `false` to send 4:1 IMA ADPCM (64 kbps) instead, if the link
-can't keep up (other Bluetooth devices on the phone, long range) or to save battery.
-16 kHz is what the speech model uses, so a higher sample rate would not help.
+If the link is behind, it skips stale audio so captions stay within about 100 ms.
+If raw audio still loses over 10% for 3 seconds in a row (other Bluetooth devices on
+the phone, long range), it switches to 4:1 IMA ADPCM (64 kbps) and tries raw again
+after 1 minute, then 2, 4, up to 10, and on every new connection. Set
+`PREFER_RAW_PCM` to `false` to always send ADPCM, which also saves battery. 16 kHz is
+what the speech model uses, so a higher sample rate would not help.
 
 Once a second, the Serial Monitor (115200 baud) shows the RMS and peak level in dBFS,
 frames per second (should be 50), clipped samples, dropped frames, and the BLE state
-(`waiting`, `connected`, or `streaming`), audio format, PHY (`2M` is the fast mode),
-MTU, packets sent per second, and resent (`retry`) and lost (`fail`) packets. Adjust
-`MIC_GAIN_DB` until speech peaks reach about -12 to -6 dBFS without clipping (22 dB;
-24 dB clipped on close, loud speech).
+(`waiting`, `connected`, or `streaming`), audio format (`pcm` or `adpcm`), PHY (`2M`
+is the fast mode), MTU, packets sent per second, and totals of resent (`retry`),
+skipped-as-stale (`late`), and lost (`fail`) packets. Adjust `MIC_GAIN_DB` until
+speech peaks reach about -12 to -6 dBFS without clipping (22 dB; 24 dB clipped on
+close, loud speech).
 
 Captions sent back by the phone are printed as `[CAPTION] ...` lines. Display output
 is not implemented yet.
