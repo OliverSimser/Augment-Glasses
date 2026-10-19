@@ -14,9 +14,12 @@ final class GlassesLink: NSObject {
     /// About three lines on a small display; also keeps the ESP32's Serial log readable.
     static let captionMaxBytes = 180
     private static let captionMinInterval: TimeInterval = 0.1
-    private static let headerBytes = 4
-    /// Longer gaps are not padded with silence; the speech model copes with a jump.
-    private static let maxLostPacketsToPad = 10
+    private static let headerBytes = 2  // seq, codec
+    private static let codecPCM: UInt8 = 1
+    private static let codecADPCM: UInt8 = 2
+    private static let adpcmStateBytes = 3  // step index, predictor
+    /// Longer gaps (200 ms) are not padded with silence; the speech model copes with a jump.
+    private static let maxPaddingSamples = 3200
 
     enum State: String {
         case bluetoothOff = "Bluetooth is off"
@@ -147,20 +150,37 @@ final class GlassesLink: NSObject {
         let bytes = [UInt8](data)
         guard bytes.count > Self.headerBytes else { return }
 
+        let samples: [Int16]
+        switch bytes[1] {
+        case Self.codecPCM:
+            let body = bytes[Self.headerBytes...]
+            samples = stride(from: body.startIndex, to: body.endIndex - 1, by: 2).map {
+                Int16(bitPattern: UInt16(bytes[$0]) | UInt16(bytes[$0 + 1]) << 8)
+            }
+        case Self.codecADPCM:
+            let state = Self.headerBytes
+            guard bytes.count > state + Self.adpcmStateBytes else { return }
+            let predictor = Int16(bitPattern: UInt16(bytes[state + 1]) | UInt16(bytes[state + 2]) << 8)
+            samples = ImaAdpcm.decode(bytes[(state + Self.adpcmStateBytes)...],
+                                      predictor: predictor, stepIndex: bytes[state])
+        default:
+            print("Glasses link: unknown audio codec \(bytes[1]); update the app or the sketch")
+            return
+        }
+
         let seq = bytes[0]
         if let lastSeq {
             let gap = Int(seq &- lastSeq &- 1)
             if gap > 0 {
                 lostPackets += gap
-                if gap <= Self.maxLostPacketsToPad, lastPacketSamples > 0 {
-                    onAudio?([Int16](repeating: 0, count: gap * lastPacketSamples))
+                let padding = gap * lastPacketSamples
+                if padding > 0, padding <= Self.maxPaddingSamples {
+                    onAudio?([Int16](repeating: 0, count: padding))
                 }
             }
         }
         lastSeq = seq
 
-        let predictor = Int16(bitPattern: UInt16(bytes[2]) | UInt16(bytes[3]) << 8)
-        let samples = ImaAdpcm.decode(bytes[Self.headerBytes...], predictor: predictor, stepIndex: bytes[1])
         lastPacketSamples = samples.count
         packetCount += 1
         onAudio?(samples)
