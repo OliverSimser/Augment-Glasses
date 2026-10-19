@@ -1,22 +1,24 @@
-// Augment-Glasses: INMP441 speech capture on an ESP32, streamed to an iPhone over BLE.
-// Captures 16 kHz, 16-bit mono PCM in 20 ms frames, compresses it 4:1 with IMA ADPCM
-// (64 kbps), and notifies it to the phone. The phone transcribes it and writes the
-// caption text back, which is printed to Serial until the display is added.
-// No WiFi is used.
+// Augment-Glasses: INMP441 speech capture on an ESP32-S3, streamed to an iPhone over BLE.
+// Captures 16 kHz, 16-bit mono PCM in 20 ms frames and notifies it to the phone
+// uncompressed (256 kbps), or 4:1 IMA ADPCM compressed (64 kbps) if SEND_RAW_PCM is
+// false. The phone transcribes it and writes the caption text back, which is printed
+// to Serial until the display is added. No WiFi is used.
 //
-// Board: "ESP32 Dev Module" or "ESP32S3 Dev Module". Serial Monitor at 115200.
-// Wiring, INMP441 L/R -> GND, VDD -> 3V3, plus:
-//   ESP32     SCK -> GPIO 26, WS -> GPIO 25, SD -> GPIO 33 (same as washer_bluer.ino)
-//   ESP32-S3  SCK -> GPIO 4,  WS -> GPIO 5,  SD -> GPIO 6  (same as dryer_and_washer_bluer.ino)
-// On the S3, use the USB port marked UART/COM, or enable Tools > USB CDC On Boot to
-// get the Serial Monitor on the native USB port.
+// Board: "ESP32S3 Dev Module", Arduino-ESP32 core 3.3 or later (for the NimBLE stack).
+// Serial Monitor at 115200; use the USB port marked UART/COM, or enable
+// Tools > USB CDC On Boot to get it on the native USB port.
+// Wiring (same as dryer_and_washer_bluer.ino):
+//   INMP441  SCK -> GPIO 4, WS -> GPIO 5, SD -> GPIO 6, L/R -> GND, VDD -> 3V3
 //
 // BLE protocol (the iPhone app in ../../iOS must match):
 //   Service  4a8e0001-6c2b-4e5f-9a3d-1c7b2f0e8d10
-//   Audio    4a8e0002-...  notify. [seq u8][step index u8][predictor i16 LE][ADPCM nibbles,
-//            low nibble first]. Each packet carries the decoder state, so a lost packet
-//            only loses its own audio. Frames dropped on the ESP32 skip sequence numbers,
-//            so the phone sees them as lost packets and pads them with silence.
+//   Audio    4a8e0002-...  notify. [seq u8][codec u8][body]
+//              codec 1 = PCM:   body is int16 LE samples.
+//              codec 2 = ADPCM: body is [step index u8][predictor i16 LE][IMA ADPCM
+//                               nibbles, low nibble first].
+//            Every packet decodes on its own, so a lost packet only loses its own
+//            audio. Frames dropped on the ESP32 skip sequence numbers, so the phone
+//            sees them as lost packets and pads them with silence.
 //   Caption  4a8e0003-...  write / write-without-response. [flags u8][UTF-8 text].
 //            flags bit 0 = text is final. The text is the whole caption to show.
 #include <Arduino.h>
@@ -25,32 +27,30 @@
 #include <freertos/queue.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
-// The classic ESP32 uses the Bluedroid BLE stack. The S3 uses NimBLE on Arduino-ESP32
-// core 3.3 and later (Bluedroid on 3.0-3.2); NimBLE adds the subscribe descriptor
-// itself and has different callback signatures.
-#if defined(CONFIG_BLUEDROID_ENABLED)
-#include <BLE2902.h>
+
+#if !CONFIG_IDF_TARGET_ESP32S3
+#error "This sketch is for the ESP32-S3. Select Tools > Board > ESP32S3 Dev Module."
+#endif
+#if !defined(CONFIG_NIMBLE_ENABLED)
+#error "Needs the NimBLE BLE stack: update the esp32 core to 3.3 or later in Boards Manager."
 #endif
 
 // ---------------- Pins ----------------
-#if CONFIG_IDF_TARGET_ESP32
-#define I2S_SCK 26
-#define I2S_WS 25
-#define I2S_SD 33
-#elif CONFIG_IDF_TARGET_ESP32S3
-// GPIO 26-37 are taken by flash/PSRAM on most S3 modules, so the S3 uses low pins.
+// GPIO 26-37 are taken by flash/PSRAM on most S3 modules, so the mic uses low pins.
 #define I2S_SCK 4
 #define I2S_WS 5
 #define I2S_SD 6
-#else
-#error "Pins are only defined for the ESP32 and ESP32-S3"
-#endif
 
 // ---------------- Audio format ----------------
 const uint32_t SAMPLE_RATE = 16000;  // speech content is below 8 kHz; STT models run at 16 kHz
 const uint32_t FRAME_MS = 20;
 const size_t FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 320 samples = 640 bytes
 const size_t QUEUE_FRAMES = 25;                              // 500 ms of slack for BLE stalls
+
+// Raw PCM is lossless and uses the S3's 2M PHY to carry 4x the data. ADPCM is the
+// fallback for a weak or busy link (other Bluetooth devices on the phone), and uses
+// about a quarter of the radio time, which saves battery on both ends.
+const bool SEND_RAW_PCM = true;
 
 // The INMP441 is quiet: conversation at 1 m (~60 dB SPL) lands near -60 dBFS at
 // unity gain. Tune with the level log so speech peaks sit around -12 to -6 dBFS.
@@ -110,26 +110,33 @@ unsigned long lastLevelPrint = 0;
 #define AUDIO_CHAR_UUID "4a8e0002-6c2b-4e5f-9a3d-1c7b2f0e8d10"
 #define CAPTION_CHAR_UUID "4a8e0003-6c2b-4e5f-9a3d-1c7b2f0e8d10"
 
-const size_t AUDIO_HEADER_BYTES = 4;
+const uint8_t CODEC_PCM = 1;
+const uint8_t CODEC_ADPCM = 2;
+const size_t AUDIO_HEADER_BYTES = 2;  // seq, codec
+const size_t ADPCM_STATE_BYTES = 3;   // step index, predictor
 const uint16_t DEFAULT_ATT_MTU = 23;
 const uint16_t MAX_ATT_MTU = 517;
 const size_t MAX_CAPTION_BYTES = MAX_ATT_MTU - 3 - 1;  // one ATT write, minus the flags byte
 
+// A notify fails when NimBLE's send buffers are full, i.e. the radio is briefly
+// behind. Retrying for up to 20 ms rides that out instead of losing the audio.
+const int NOTIFY_ATTEMPTS = 5;
+const uint32_t NOTIFY_RETRY_MS = 5;
+
 BLEServer* bleServer = NULL;
 BLECharacteristic* audioChar = NULL;
-#if defined(CONFIG_BLUEDROID_ENABLED)
-BLE2902* audioCccd = NULL;
-#else
-volatile bool audioNotifying = false;  // set from NimBLE's onSubscribe
-#endif
 
 volatile bool bleConnected = false;
+volatile bool audioNotifying = false;  // set from onSubscribe
 volatile uint16_t peerMtu = DEFAULT_ATT_MTU;
+volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE;
+volatile bool lastNotifyOk = false;  // set by onStatus, synchronously from notify()
 
 uint8_t audioSeq = 0;
 uint8_t audioPacket[MAX_ATT_MTU];
 uint32_t packetsThisSecond = 0;
-uint32_t notifyFailures = 0;
+uint32_t notifyRetries = 0;   // packets that needed more than one attempt
+uint32_t notifyFailures = 0;  // packets lost after every attempt
 
 // Written by the BLE task, read by loop().
 portMUX_TYPE captionMux = portMUX_INITIALIZER_UNLOCKED;
@@ -325,77 +332,56 @@ uint8_t adpcmEncode(int16_t sample) {
 }
 
 // ---------------- BLE callbacks ----------------
-// 15-30 ms interval, inside Apple's accessory guidelines. 50 packets/s needs at
-// most two packets per connection event.
+// 15 ms interval, the fastest Apple's accessory guidelines allow (min == max == 15 ms
+// is a permitted combination). Raw PCM is about 4-8 packets per 20 ms frame, so more
+// connection events per second leave headroom.
 const uint16_t CONN_MIN_INTERVAL = 12;  // x 1.25 ms
-const uint16_t CONN_MAX_INTERVAL = 24;
+const uint16_t CONN_MAX_INTERVAL = 12;
 const uint16_t CONN_TIMEOUT = 400;  // x 10 ms
 
-void onPhoneConnected() {
-  bleConnected = true;
-  Serial.println("[BLE] phone connected");
-}
-
-void onPhoneDisconnected() {
-  bleConnected = false;
-  peerMtu = DEFAULT_ATT_MTU;
-  // The phone re-subscribes after it reconnects. Bluedroid would otherwise keep
-  // the old subscription flag across connections.
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  if (audioCccd != NULL) audioCccd->setNotifications(false);
-#else
-  audioNotifying = false;
-#endif
-  Serial.println("[BLE] phone disconnected, advertising again");
-}
-
-void onMtu(uint16_t mtu) {
-  peerMtu = mtu;
-  Serial.printf("[BLE] MTU %u\n", (unsigned)mtu);
-}
+// LE Data Length Extension: up to 251 bytes per radio packet instead of 27, so a
+// notification goes out in one air packet instead of being split into many.
+const uint16_t DLE_TX_OCTETS = 251;
+const uint16_t DLE_TX_TIME_US = 2120;
 
 class ServerCallbacks : public BLEServerCallbacks {
   using BLEServerCallbacks::onConnect;
   using BLEServerCallbacks::onDisconnect;
   using BLEServerCallbacks::onMtuChanged;
 
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  void onConnect(BLEServer* server, esp_ble_gatts_cb_param_t* param) override {
-    onPhoneConnected();
-    server->requestConnParams(param->connect.remote_bda, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, 0, CONN_TIMEOUT);
-  }
-  void onDisconnect(BLEServer*, esp_ble_gatts_cb_param_t*) override {
-    onPhoneDisconnected();
-  }
-  void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
-    onMtu(param->mtu.mtu);
-  }
-#else
   void onConnect(BLEServer* server, ble_gap_conn_desc* desc) override {
-    onPhoneConnected();
+    connHandle = desc->conn_handle;
+    bleConnected = true;
+    Serial.println("[BLE] phone connected");
     server->requestConnParams(desc->conn_handle, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, 0, CONN_TIMEOUT);
+    // 2M PHY doubles the air rate (BLE 5; the original ESP32 could not do this). The
+    // phone may decline; the status line shows which PHY is in use.
+    ble_gap_set_prefered_le_phy(desc->conn_handle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK,
+                                BLE_GAP_LE_PHY_CODED_ANY);
+    ble_gap_set_data_len(desc->conn_handle, DLE_TX_OCTETS, DLE_TX_TIME_US);
   }
   void onDisconnect(BLEServer*, ble_gap_conn_desc*) override {
-    onPhoneDisconnected();
+    bleConnected = false;
+    audioNotifying = false;  // the phone subscribes again after it reconnects
+    peerMtu = DEFAULT_ATT_MTU;
+    connHandle = BLE_HS_CONN_HANDLE_NONE;
+    Serial.println("[BLE] phone disconnected, advertising again");
   }
   void onMtuChanged(BLEServer*, ble_gap_conn_desc*, uint16_t mtu) override {
-    onMtu(mtu);
+    peerMtu = mtu;
+    Serial.printf("[BLE] MTU %u\n", (unsigned)mtu);
   }
-#endif
 };
 
 class AudioCallbacks : public BLECharacteristicCallbacks {
   // Called synchronously from notify(), i.e. from loop().
   void onStatus(BLECharacteristic*, Status s, uint32_t) override {
-    if (s == Status::SUCCESS_NOTIFY) packetsThisSecond++;
-    else if (s == Status::ERROR_GATT) notifyFailures++;
+    lastNotifyOk = (s == Status::SUCCESS_NOTIFY);
   }
 
-#if !defined(CONFIG_BLUEDROID_ENABLED)
   void onSubscribe(BLECharacteristic*, ble_gap_conn_desc*, uint16_t subValue) override {
     audioNotifying = (subValue & 0x0001) != 0;
   }
-#endif
 };
 
 class CaptionCallbacks : public BLECharacteristicCallbacks {
@@ -429,11 +415,8 @@ void setupBle() {
 
   BLEService* service = bleServer->createService(SERVICE_UUID);
 
+  // NimBLE adds the subscribe (0x2902) descriptor itself.
   audioChar = service->createCharacteristic(AUDIO_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  audioCccd = new BLE2902();  // Bluedroid does not add the subscribe descriptor itself
-  audioChar->addDescriptor(audioCccd);
-#endif
   audioChar->setCallbacks(new AudioCallbacks());
 
   BLECharacteristic* captionChar = service->createCharacteristic(
@@ -450,15 +433,28 @@ void setupBle() {
 }
 
 bool audioSubscribed() {
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  return bleConnected && audioCccd != NULL && audioCccd->getNotifications();
-#else
   return bleConnected && audioNotifying;
-#endif
 }
 
-// Splits a frame into as few packets as the negotiated MTU allows (one per frame
-// at iPhone MTUs). Each packet starts with the encoder state for its first sample.
+// Sends audioPacket[0..len). Returns false once the phone is gone.
+bool notifyAudioPacket(size_t len) {
+  audioChar->setValue(audioPacket, len);
+  for (int attempt = 0; attempt < NOTIFY_ATTEMPTS; attempt++) {
+    lastNotifyOk = false;
+    audioChar->notify();
+    if (lastNotifyOk) {
+      packetsThisSecond++;
+      if (attempt > 0) notifyRetries++;
+      return true;
+    }
+    if (!audioSubscribed()) return false;
+    vTaskDelay(pdMS_TO_TICKS(NOTIFY_RETRY_MS));
+  }
+  notifyFailures++;
+  return true;
+}
+
+// Splits a frame into as few equal packets as the negotiated MTU allows.
 void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
   static bool haveLastFrame = false;
   static uint32_t lastFrameIndex = 0;
@@ -468,13 +464,17 @@ void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
 
   if (!audioSubscribed()) return;
 
-  size_t maxPayload = (size_t)peerMtu - 3 - AUDIO_HEADER_BYTES;
-  size_t samplesPerPacket = maxPayload * 2;
-  if (samplesPerPacket > samples) samplesPerPacket = samples;
+  // ATT notification payload = MTU - 3.
+  size_t maxBody = (size_t)peerMtu - 3 - AUDIO_HEADER_BYTES;
+  size_t maxSamples = SEND_RAW_PCM ? maxBody / 2 : (maxBody - ADPCM_STATE_BYTES) * 2;
+  maxSamples &= ~(size_t)1;  // even, so ADPCM never has a half-filled last byte
+  size_t packetsPerFrame = (samples + maxSamples - 1) / maxSamples;
+  size_t samplesPerPacket = (samples + packetsPerFrame - 1) / packetsPerFrame;
+  samplesPerPacket = (samplesPerPacket + 1) & ~(size_t)1;
+  packetsPerFrame = (samples + samplesPerPacket - 1) / samplesPerPacket;
 
   // Skip the sequence numbers the dropped frames would have used; the phone fills
   // the gap with silence. Large gaps are left unpadded by the phone.
-  size_t packetsPerFrame = (samples + samplesPerPacket - 1) / samplesPerPacket;
   audioSeq += (uint8_t)(skippedFrames * packetsPerFrame);
 
   for (size_t offset = 0; offset < samples; offset += samplesPerPacket) {
@@ -482,19 +482,25 @@ void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
     if (n > samplesPerPacket) n = samplesPerPacket;
 
     audioPacket[0] = audioSeq++;
-    audioPacket[1] = (uint8_t)adpcmIndex;
-    audioPacket[2] = (uint8_t)(adpcmPredictor & 0xFF);
-    audioPacket[3] = (uint8_t)((adpcmPredictor >> 8) & 0xFF);
     size_t len = AUDIO_HEADER_BYTES;
-
-    for (size_t i = 0; i < n; i += 2) {
-      uint8_t lo = adpcmEncode(pcm[offset + i]);
-      uint8_t hi = (i + 1 < n) ? adpcmEncode(pcm[offset + i + 1]) : 0;
-      audioPacket[len++] = lo | (hi << 4);
+    if (SEND_RAW_PCM) {
+      audioPacket[1] = CODEC_PCM;
+      memcpy(audioPacket + len, pcm + offset, n * sizeof(int16_t));  // the S3 is little-endian
+      len += n * sizeof(int16_t);
+    } else {
+      // Each packet starts with the encoder state for its first sample.
+      audioPacket[1] = CODEC_ADPCM;
+      audioPacket[len++] = (uint8_t)adpcmIndex;
+      audioPacket[len++] = (uint8_t)(adpcmPredictor & 0xFF);
+      audioPacket[len++] = (uint8_t)((adpcmPredictor >> 8) & 0xFF);
+      for (size_t i = 0; i < n; i += 2) {
+        uint8_t lo = adpcmEncode(pcm[offset + i]);
+        uint8_t hi = (i + 1 < n) ? adpcmEncode(pcm[offset + i + 1]) : 0;
+        audioPacket[len++] = lo | (hi << 4);
+      }
     }
 
-    audioChar->setValue(audioPacket, len);
-    audioChar->notify();
+    if (!notifyAudioPacket(len)) return;
   }
 }
 
@@ -535,15 +541,24 @@ float toDbfs(double amplitude) {
   return 20.0f * log10f((float)(amplitude / 32768.0));
 }
 
+// "2M" once the phone has accepted the faster PHY.
+const char* currentPhy() {
+  uint16_t handle = connHandle;
+  uint8_t tx = 0, rx = 0;
+  if (handle == BLE_HS_CONN_HANDLE_NONE || ble_gap_read_le_phy(handle, &tx, &rx) != 0) return "-";
+  return tx == BLE_GAP_LE_PHY_2M ? "2M" : (tx == BLE_GAP_LE_PHY_1M ? "1M" : "coded");
+}
+
 void printLevel() {
   double rms = levelSamples ? sqrt(levelSumSquares / levelSamples) : 0.0;
   const char* ble = audioSubscribed() ? "streaming" : (bleConnected ? "connected" : "waiting");
   Serial.printf("[MIC] rms %6.1f dBFS  peak %6.1f dBFS  frames %2u/s  clipped %u  dropped %u  %s"
-                "  | ble %s  pkts %2u/s  fail %u\n",
+                "  | ble %s %s %s MTU %u  pkts %3u/s  retry %u  fail %u\n",
                 toDbfs(rms), toDbfs(levelPeak), (unsigned)framesThisSecond,
                 (unsigned)clippedThisSecond, (unsigned)droppedFrames,
                 micHealthy ? "ok" : "NO SIGNAL",
-                ble, (unsigned)packetsThisSecond, (unsigned)notifyFailures);
+                ble, SEND_RAW_PCM ? "pcm" : "adpcm", currentPhy(), (unsigned)peerMtu,
+                (unsigned)packetsThisSecond, (unsigned)notifyRetries, (unsigned)notifyFailures);
   levelSumSquares = 0.0;
   levelPeak = 0;
   levelSamples = 0;
@@ -555,8 +570,9 @@ void printLevel() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.printf("Augment-Glasses mic: %u Hz, 16-bit mono, %u ms frames, gain %+.0f dB\n",
-                (unsigned)SAMPLE_RATE, (unsigned)FRAME_MS, MIC_GAIN_DB);
+  Serial.printf("Augment-Glasses mic: %u Hz, 16-bit mono, %u ms frames, gain %+.0f dB, sending %s\n",
+                (unsigned)SAMPLE_RATE, (unsigned)FRAME_MS, MIC_GAIN_DB,
+                SEND_RAW_PCM ? "raw PCM" : "IMA ADPCM");
 
   gainLinear = powf(10.0f, MIC_GAIN_DB / 20.0f);
 

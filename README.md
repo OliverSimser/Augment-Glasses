@@ -4,7 +4,8 @@ See-through captioning glasses using virtual-image optics to display real-time s
 ## Arduino sketch
 
 Open [speech_text_screen.ino](Arduino/speech_text_screen/speech_text_screen.ino)
-in the Arduino IDE and select **ESP32S3 Dev Module**.
+in the Arduino IDE and select **ESP32S3 Dev Module** (esp32 core 3.3 or later in
+Boards Manager).
 
 Wiring (INMP441 I2S microphone):
 
@@ -16,13 +17,18 @@ Wiring (INMP441 I2S microphone):
 | L/R     | GND      |
 | VDD     | 3V3      |
 
-The sketch captures 16 kHz, 16-bit mono PCM in 20 ms frames, compresses it 4:1 with
-IMA ADPCM (64 kbps), and streams it to the iPhone app over BLE. Once a second, the
-Serial Monitor (115200 baud) shows the RMS and peak level in dBFS, frames per second
-(should be 50), clipped samples, dropped frames, and the BLE state (`waiting`,
-`connected`, or `streaming`) with packets sent per second. Adjust `MIC_GAIN_DB` until
-speech peaks reach about -12 to -6 dBFS without clipping (22 dB; 24 dB clipped on
-close, loud speech).
+The sketch captures 16 kHz, 16-bit mono PCM in 20 ms frames and streams it to the
+iPhone app over BLE uncompressed (256 kbps), using the S3's faster 2M Bluetooth mode.
+Set `SEND_RAW_PCM` to `false` to send 4:1 IMA ADPCM (64 kbps) instead, if the link
+can't keep up (other Bluetooth devices on the phone, long range) or to save battery.
+16 kHz is what the speech model uses, so a higher sample rate would not help.
+
+Once a second, the Serial Monitor (115200 baud) shows the RMS and peak level in dBFS,
+frames per second (should be 50), clipped samples, dropped frames, and the BLE state
+(`waiting`, `connected`, or `streaming`), audio format, PHY (`2M` is the fast mode),
+MTU, packets sent per second, and resent (`retry`) and lost (`fail`) packets. Adjust
+`MIC_GAIN_DB` until speech peaks reach about -12 to -6 dBFS without clipping (22 dB;
+24 dB clipped on close, loud speech).
 
 Captions sent back by the phone are printed as `[CAPTION] ...` lines. Display output
 is not implemented yet.
@@ -31,7 +37,7 @@ is not implemented yet.
 
 Everything goes over BLE:
 
-1. The ESP32 advertises as `AugmentGlasses` and streams compressed audio.
+1. The ESP32-S3 advertises as `AugmentGlasses` and streams the microphone audio.
 2. The iPhone app connects, decodes the audio, and transcribes it with Apple's
    on-device speech-to-text (`SpeechAnalyzer`, iOS 26). No audio leaves the phone,
    and it works without cell data after the one-time model download. (A cloud
@@ -82,11 +88,12 @@ installs expire after 7 days and must be reinstalled from Xcode.
 
 ### First run
 
-1. Power the ESP32 and open its Serial Monitor.
+1. Power the ESP32-S3 and open its Serial Monitor.
 2. Open the app and allow Bluetooth and Speech Recognition. On first launch it
    downloads the speech model for your language (needs data or WiFi once).
-3. The app shows **Receiving audio** with about 50 packets/s and 0 lost. The Serial
-   Monitor shows `ble streaming  pkts 50/s  fail 0`.
+3. The app shows **Receiving audio** with 0 lost. Packets/s depends on the MTU: about
+   100-200 for raw PCM, 50 for ADPCM. The Serial Monitor shows `ble streaming`, the
+   same packets/s, and `fail 0`.
 4. Speak near the mic. Captions appear in the app and as `[CAPTION]` lines in the
    Serial Monitor.
 
