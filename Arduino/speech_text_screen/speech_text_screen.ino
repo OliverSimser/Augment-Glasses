@@ -1,7 +1,8 @@
 // Augment-Glasses: INMP441 speech capture on an ESP32-S3, streamed to an iPhone over BLE.
 // Captures 16 kHz, 16-bit mono PCM in 20 ms frames and notifies it to the phone
-// uncompressed (256 kbps), or 4:1 IMA ADPCM compressed (64 kbps) if SEND_RAW_PCM is
-// false. The phone transcribes it and writes the caption text back, which is printed
+// uncompressed (256 kbps). If the link seriously struggles it falls back to 4:1 IMA
+// ADPCM (64 kbps) and tries raw again later; PREFER_RAW_PCM = false always sends
+// ADPCM. The phone transcribes it and writes the caption text back, which is printed
 // to Serial until the display is added. No WiFi is used.
 //
 // Board: "ESP32S3 Dev Module", Arduino-ESP32 core 3.3 or later (for the NimBLE stack).
@@ -47,10 +48,25 @@ const uint32_t FRAME_MS = 20;
 const size_t FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 320 samples = 640 bytes
 const size_t QUEUE_FRAMES = 25;                              // 500 ms of slack for BLE stalls
 
-// Raw PCM is lossless and uses the S3's 2M PHY to carry 4x the data. ADPCM is the
-// fallback for a weak or busy link (other Bluetooth devices on the phone), and uses
-// about a quarter of the radio time, which saves battery on both ends.
-const bool SEND_RAW_PCM = true;
+// Raw PCM is lossless and uses the S3's 2M PHY to carry 4x the data. IMA ADPCM uses
+// a quarter of the radio time. With PREFER_RAW_PCM, raw is sent unless the link is
+// seriously losing audio, and then it falls back to ADPCM (see updateLinkHealth()).
+// Set it to false to always send ADPCM, e.g. to save battery.
+const bool PREFER_RAW_PCM = true;
+
+// Latency cap: more frames than this waiting means the link is behind, so stale
+// frames are skipped (the phone pads short gaps with silence) instead of letting
+// captions fall up to the full 500 ms queue behind.
+const UBaseType_t MAX_BACKLOG_FRAMES = 5;  // 100 ms
+
+// Fall back to ADPCM only on serious trouble: over 10% of the audio lost for 3 s in
+// a row. Retries alone don't count; they recovered the audio.
+const uint32_t BAD_LOST_FRAMES_PER_SECOND = 5;
+const int BAD_SECONDS_TO_FALL_BACK = 3;
+// Raw PCM is tried again after this long, doubling each retry (up to 10 min), and on
+// every new connection.
+const uint32_t RAW_RETRY_FIRST_MS = 60000;
+const uint32_t RAW_RETRY_MAX_MS = 600000;
 
 // The INMP441 is quiet: conversation at 1 m (~60 dB SPL) lands near -60 dBFS at
 // unity gain. Tune with the level log so speech peaks sit around -12 to -6 dBFS.
@@ -137,6 +153,16 @@ uint8_t audioPacket[MAX_ATT_MTU];
 uint32_t packetsThisSecond = 0;
 uint32_t notifyRetries = 0;   // packets that needed more than one attempt
 uint32_t notifyFailures = 0;  // packets lost after every attempt
+
+// Link health and codec choice; loop() only.
+enum class SendResult { Sent, Lost, Gone };
+bool useRawPcm = PREFER_RAW_PCM;
+uint32_t lateFrames = 0;            // skipped because the link was behind
+uint32_t lostFramesThisSecond = 0;  // late, or with a lost packet
+uint32_t lastDroppedFrames = 0;
+int badSeconds = 0;
+uint32_t rawRetryMs = RAW_RETRY_FIRST_MS;
+unsigned long fellBackAt = 0;
 
 // Written by the BLE task, read by loop().
 portMUX_TYPE captionMux = portMUX_INITIALIZER_UNLOCKED;
@@ -436,8 +462,12 @@ bool audioSubscribed() {
   return bleConnected && audioNotifying;
 }
 
-// Sends audioPacket[0..len). Returns false once the phone is gone.
-bool notifyAudioPacket(size_t len) {
+bool linkBehind() {
+  return uxQueueMessagesWaiting(audioQueue) > MAX_BACKLOG_FRAMES;
+}
+
+// Sends audioPacket[0..len).
+SendResult notifyAudioPacket(size_t len) {
   audioChar->setValue(audioPacket, len);
   for (int attempt = 0; attempt < NOTIFY_ATTEMPTS; attempt++) {
     lastNotifyOk = false;
@@ -445,28 +475,30 @@ bool notifyAudioPacket(size_t len) {
     if (lastNotifyOk) {
       packetsThisSecond++;
       if (attempt > 0) notifyRetries++;
-      return true;
+      return SendResult::Sent;
     }
-    if (!audioSubscribed()) return false;
+    if (!audioSubscribed()) return SendResult::Gone;
+    if (linkBehind()) break;  // waiting would only make the backlog worse
     vTaskDelay(pdMS_TO_TICKS(NOTIFY_RETRY_MS));
   }
   notifyFailures++;
-  return true;
+  return SendResult::Lost;
 }
 
 // Splits a frame into as few equal packets as the negotiated MTU allows.
-void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
+// Returns true if any of the frame's audio was lost.
+bool sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
   static bool haveLastFrame = false;
   static uint32_t lastFrameIndex = 0;
   uint32_t skippedFrames = haveLastFrame ? frameIndex - lastFrameIndex - 1 : 0;
   haveLastFrame = true;
   lastFrameIndex = frameIndex;
 
-  if (!audioSubscribed()) return;
+  if (!audioSubscribed()) return false;
 
   // ATT notification payload = MTU - 3.
   size_t maxBody = (size_t)peerMtu - 3 - AUDIO_HEADER_BYTES;
-  size_t maxSamples = SEND_RAW_PCM ? maxBody / 2 : (maxBody - ADPCM_STATE_BYTES) * 2;
+  size_t maxSamples = useRawPcm ? maxBody / 2 : (maxBody - ADPCM_STATE_BYTES) * 2;
   maxSamples &= ~(size_t)1;  // even, so ADPCM never has a half-filled last byte
   size_t packetsPerFrame = (samples + maxSamples - 1) / maxSamples;
   size_t samplesPerPacket = (samples + packetsPerFrame - 1) / packetsPerFrame;
@@ -477,13 +509,14 @@ void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
   // the gap with silence. Large gaps are left unpadded by the phone.
   audioSeq += (uint8_t)(skippedFrames * packetsPerFrame);
 
+  bool lost = false;
   for (size_t offset = 0; offset < samples; offset += samplesPerPacket) {
     size_t n = samples - offset;
     if (n > samplesPerPacket) n = samplesPerPacket;
 
     audioPacket[0] = audioSeq++;
     size_t len = AUDIO_HEADER_BYTES;
-    if (SEND_RAW_PCM) {
+    if (useRawPcm) {
       audioPacket[1] = CODEC_PCM;
       memcpy(audioPacket + len, pcm + offset, n * sizeof(int16_t));  // the S3 is little-endian
       len += n * sizeof(int16_t);
@@ -500,8 +533,11 @@ void sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
       }
     }
 
-    if (!notifyAudioPacket(len)) return;
+    SendResult r = notifyAudioPacket(len);
+    if (r == SendResult::Gone) return lost;
+    if (r == SendResult::Lost) lost = true;
   }
+  return lost;
 }
 
 // This is where the caption will be drawn on the display.
@@ -533,7 +569,56 @@ void handleAudioFrame(const AudioFrame& frame) {
   levelSamples += samples;
   framesThisSecond++;
 
-  sendAudioFrame(frame.index, pcm, samples);
+  if (audioSubscribed() && linkBehind()) {
+    // Skipped frames leave a gap in the sequence numbers, like dropped ones.
+    lateFrames++;
+    lostFramesThisSecond++;
+    return;
+  }
+  if (sendAudioFrame(frame.index, pcm, samples)) lostFramesThisSecond++;
+}
+
+void setRawPcm(bool raw, const char* why) {
+  if (raw == useRawPcm) return;
+  useRawPcm = raw;
+  adpcmPredictor = 0;  // stale encoder state from long ago would start with a click
+  adpcmIndex = 0;
+  Serial.printf("[BLE] now sending %s (%s)\n", raw ? "raw PCM" : "IMA ADPCM", why);
+}
+
+// Runs once a second. Falls back to ADPCM when raw PCM keeps losing audio, and
+// tries raw again later.
+void updateLinkHealth() {
+  static bool wasStreaming = false;
+  uint32_t dropped = droppedFrames;
+  uint32_t lost = lostFramesThisSecond + (dropped - lastDroppedFrames);
+  lastDroppedFrames = dropped;
+  lostFramesThisSecond = 0;
+
+  bool streaming = audioSubscribed();
+  if (streaming && !wasStreaming) {  // new connection: give raw PCM a fresh chance
+    rawRetryMs = RAW_RETRY_FIRST_MS;
+    setRawPcm(PREFER_RAW_PCM, "new connection");
+  }
+  wasStreaming = streaming;
+  if (!streaming) {
+    badSeconds = 0;
+    return;
+  }
+
+  if (useRawPcm) {
+    badSeconds = (lost > BAD_LOST_FRAMES_PER_SECOND) ? badSeconds + 1 : 0;
+    if (badSeconds >= BAD_SECONDS_TO_FALL_BACK) {
+      badSeconds = 0;
+      fellBackAt = millis();
+      Serial.printf("[BLE] raw PCM lost over 10%% of the audio for %d s; retrying it in %u s\n",
+                    BAD_SECONDS_TO_FALL_BACK, (unsigned)(rawRetryMs / 1000));
+      setRawPcm(false, "link congested");
+    }
+  } else if (PREFER_RAW_PCM && millis() - fellBackAt >= rawRetryMs) {
+    if (rawRetryMs < RAW_RETRY_MAX_MS) rawRetryMs = min(rawRetryMs * 2, RAW_RETRY_MAX_MS);
+    setRawPcm(true, "retrying");
+  }
 }
 
 float toDbfs(double amplitude) {
@@ -553,12 +638,13 @@ void printLevel() {
   double rms = levelSamples ? sqrt(levelSumSquares / levelSamples) : 0.0;
   const char* ble = audioSubscribed() ? "streaming" : (bleConnected ? "connected" : "waiting");
   Serial.printf("[MIC] rms %6.1f dBFS  peak %6.1f dBFS  frames %2u/s  clipped %u  dropped %u  %s"
-                "  | ble %s %s %s MTU %u  pkts %3u/s  retry %u  fail %u\n",
+                "  | ble %s %s %s MTU %u  pkts %3u/s  retry %u  late %u  fail %u\n",
                 toDbfs(rms), toDbfs(levelPeak), (unsigned)framesThisSecond,
                 (unsigned)clippedThisSecond, (unsigned)droppedFrames,
                 micHealthy ? "ok" : "NO SIGNAL",
-                ble, SEND_RAW_PCM ? "pcm" : "adpcm", currentPhy(), (unsigned)peerMtu,
-                (unsigned)packetsThisSecond, (unsigned)notifyRetries, (unsigned)notifyFailures);
+                ble, useRawPcm ? "pcm" : "adpcm", currentPhy(), (unsigned)peerMtu,
+                (unsigned)packetsThisSecond, (unsigned)notifyRetries, (unsigned)lateFrames,
+                (unsigned)notifyFailures);
   levelSumSquares = 0.0;
   levelPeak = 0;
   levelSamples = 0;
@@ -570,9 +656,9 @@ void printLevel() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.printf("Augment-Glasses mic: %u Hz, 16-bit mono, %u ms frames, gain %+.0f dB, sending %s\n",
+  Serial.printf("Augment-Glasses mic: %u Hz, 16-bit mono, %u ms frames, gain %+.0f dB, %s\n",
                 (unsigned)SAMPLE_RATE, (unsigned)FRAME_MS, MIC_GAIN_DB,
-                SEND_RAW_PCM ? "raw PCM" : "IMA ADPCM");
+                PREFER_RAW_PCM ? "raw PCM, ADPCM if the link struggles" : "IMA ADPCM");
 
   gainLinear = powf(10.0f, MIC_GAIN_DB / 20.0f);
 
@@ -607,6 +693,7 @@ void loop() {
 
   if (millis() - lastLevelPrint >= 1000) {
     lastLevelPrint = millis();
+    updateLinkHealth();
     printLevel();
   }
 }
