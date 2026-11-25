@@ -1,15 +1,24 @@
-// Augment-Glasses: INMP441 speech capture on an ESP32-S3, streamed to an iPhone over BLE.
+// Augment-Glasses: INMP441 speech capture on an ESP32-S3 or ESP32-C3, streamed to an
+// iPhone over BLE.
 // Captures 16 kHz, 16-bit mono PCM in 20 ms frames and notifies it to the phone
 // uncompressed (256 kbps). If the link seriously struggles it falls back to 4:1 IMA
 // ADPCM (64 kbps) and tries raw again later; PREFER_RAW_PCM = false always sends
-// ADPCM. The phone transcribes it and writes the caption text back, which is printed
-// to Serial until the display is added. No WiFi is used.
+// ADPCM. The phone transcribes it and writes the caption text back, which is drawn on
+// the OLED (needs the U8g2 library) and printed to Serial. No WiFi is used.
 //
-// Board: "ESP32S3 Dev Module", Arduino-ESP32 core 3.3 or later (for the NimBLE stack).
-// Serial Monitor at 115200; use the USB port marked UART/COM, or enable
-// Tools > USB CDC On Boot to get it on the native USB port.
-// Wiring (same as dryer_and_washer_bluer.ino):
-//   INMP441  SCK -> GPIO 4, WS -> GPIO 5, SD -> GPIO 6, L/R -> GND, VDD -> 3V3
+// Board: "ESP32S3 Dev Module" or "ESP32C3 Dev Module", Arduino-ESP32 core 3.3 or later
+// (for the NimBLE stack). The pins and screen are picked from the selected board.
+// Serial Monitor at 115200. Mini S3 and C3 boards only have the native USB port, so set
+// Tools > USB CDC On Boot > Enabled or the Serial Monitor stays blank.
+// ESP32-S3 wiring (only GPIO 1-13 are used, which mini S3 boards also have):
+//   INMP441  SCK -> GPIO 4, WS -> GPIO 5, SD -> GPIO 6, L/R -> GPIO 2 (driven LOW,
+//            selects the left channel), GND -> GND pin, VDD -> 3V3
+//   OLED     0.96" SSD1306, 4-pin I2C: GND -> GPIO 7 (driven LOW as its ground),
+//            VCC -> 3V3 (spliced with the INMP441's VDD), SCL -> GPIO 8, SDA -> GPIO 9
+// ESP32-C3 board with the built-in 0.42" 72x40 OLED (screen already wired to SDA GPIO 5,
+// SCL GPIO 6):
+//   INMP441  SCK -> GPIO 4, WS -> GPIO 3, SD -> GPIO 1, L/R -> GPIO 0 (driven LOW),
+//            GND -> GND pin, VDD -> 3V3
 //
 // BLE protocol (the iPhone app in ../../iOS must match):
 //   Service  4a8e0001-6c2b-4e5f-9a3d-1c7b2f0e8d10
@@ -24,23 +33,81 @@
 //            flags bit 0 = text is final. The text is the whole caption to show.
 #include <Arduino.h>
 #include <math.h>
+#include <driver/gpio.h>
 #include <driver/i2s_std.h>
 #include <freertos/queue.h>
+#include <Wire.h>
+#include <U8g2lib.h>  // Library Manager: "U8g2" by oliver
 #include <BLEDevice.h>
 #include <BLEServer.h>
 
-#if !CONFIG_IDF_TARGET_ESP32S3
-#error "This sketch is for the ESP32-S3. Select Tools > Board > ESP32S3 Dev Module."
+#if !CONFIG_IDF_TARGET_ESP32S3 && !CONFIG_IDF_TARGET_ESP32C3
+#error "This sketch is for the ESP32-S3 or ESP32-C3. Select ESP32S3 or ESP32C3 Dev Module."
 #endif
 #if !defined(CONFIG_NIMBLE_ENABLED)
 #error "Needs the NimBLE BLE stack: update the esp32 core to 3.3 or later in Boards Manager."
 #endif
 
 // ---------------- Pins ----------------
-// GPIO 26-37 are taken by flash/PSRAM on most S3 modules, so the mic uses low pins.
+// L/R is a logic input that draws no current, so a LOW GPIO works as well as GND. The
+// mic's own GND stays on a real GND pin: its supply noise ends up in the audio.
+#if CONFIG_IDF_TARGET_ESP32C3
+// Avoided: GPIO 2, 8 and 9 (boot strapping; 9 is BOOT), 5/6 (built-in OLED),
+// 18/19 (USB) and 20/21 (UART).
+#define I2S_SCK 4
+#define I2S_WS 3
+#define I2S_SD 1
+#define MIC_LR 0
+
+// The built-in 0.42" OLED: 72x40 pixels in the middle of an SSD1306's 128x64 memory.
+// The _ER driver adds the column offset. It is powered by the board, so no GND pin.
+#define OLED_SCL 6
+#define OLED_SDA 5
+#define OLED_GND -1
+U8G2_SSD1306_72X40_ER_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+const int OLED_WIDTH = 72;
+const int OLED_LINE_HEIGHT = 10;  // 4 lines of the 6x10 font, 12 characters each
+const int OLED_MAX_LINES = 4;
+#define OLED_FONT u8g2_font_6x10_tf
+#else
+// Avoided: GPIO 0 and 3 (boot strapping), 43/44 (USB-serial TX/RX), 48 (LED on many
+// boards), and 26-37 (flash/PSRAM on most S3 modules).
 #define I2S_SCK 4
 #define I2S_WS 5
 #define I2S_SD 6
+#define MIC_LR 2
+
+// The OLED's ground is a GPIO held LOW, so only its 3V3 wire needs splicing. A GPIO
+// sinks up to ~28 mA at full drive; caption text lights few pixels and draws ~5-15 mA,
+// but an all-white screen at full contrast can come close. GPIO 8 and 9 are the S3's
+// default I2C pins.
+#define OLED_GND 7
+#define OLED_SCL 8
+#define OLED_SDA 9
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+const int OLED_WIDTH = 128;
+const int OLED_LINE_HEIGHT = 16;  // 4 lines of the 7x13 font on the 64-pixel-high screen
+const int OLED_MAX_LINES = 4;
+#define OLED_FONT u8g2_font_7x13_tf
+#endif
+const uint32_t OLED_POWER_UP_MS = 100;  // SSD1306 needs stable power before init
+const uint32_t OLED_I2C_HZ = 400000;
+// true flips the text left-to-right, so it reads correctly after one mirror
+// reflection (the beam-splitter cube).
+const bool OLED_MIRROR = true;
+
+// ===== TEMPORARY (remove once the phone has the current app) =====
+// The iPhone app from before 2026-10-19 only understands ADPCM packets without the
+// codec byte: [seq][step index][predictor i16 LE][nibbles]. true sends that format,
+// so the old app still captions. Remove this, the two OLD_APP_FORMAT lines in
+// sendAudioFrame(), and set PREFER_RAW_PCM back to true.
+const bool OLD_APP_FORMAT = false;
+
+// Shows a few random words every 0.5 s while no phone is connected, to demo the
+// screen without the app. Remove this, runDemo(), and its two calls in loop().
+const bool DEMO_RANDOM_WORDS = true;
+const uint32_t DEMO_INTERVAL_MS = 500;
+// ===== END TEMPORARY =====
 
 // ---------------- Audio format ----------------
 const uint32_t SAMPLE_RATE = 16000;  // speech content is below 8 kHz; STT models run at 16 kHz
@@ -48,11 +115,11 @@ const uint32_t FRAME_MS = 20;
 const size_t FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 320 samples = 640 bytes
 const size_t QUEUE_FRAMES = 25;                              // 500 ms of slack for BLE stalls
 
-// Raw PCM is lossless and uses the S3's 2M PHY to carry 4x the data. IMA ADPCM uses
+// Raw PCM is lossless and uses BLE 5's 2M PHY to carry 4x the data. IMA ADPCM uses
 // a quarter of the radio time. With PREFER_RAW_PCM, raw is sent unless the link is
 // seriously losing audio, and then it falls back to ADPCM (see updateLinkHealth()).
 // Set it to false to always send ADPCM, e.g. to save battery.
-const bool PREFER_RAW_PCM = true;
+const bool PREFER_RAW_PCM = !OLD_APP_FORMAT;  // TEMPORARY: back to true with OLD_APP_FORMAT
 
 // Latency cap: more frames than this waiting means the link is behind, so stale
 // frames are skipped (the phone pads short gaps with silence) instead of letting
@@ -189,7 +256,7 @@ esp_err_t setupMic() {
     .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
     .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
     .gpio_cfg = {
-      .mclk = I2S_GPIO_UNUSED,  // the INMP441 has no MCLK input; keep GPIO 0 (BOOT) free
+      .mclk = I2S_GPIO_UNUSED,  // the INMP441 has no MCLK input
       .bclk = (gpio_num_t)I2S_SCK,
       .ws = (gpio_num_t)I2S_WS,
       .dout = I2S_GPIO_UNUSED,
@@ -497,7 +564,8 @@ bool sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
   if (!audioSubscribed()) return false;
 
   // ATT notification payload = MTU - 3.
-  size_t maxBody = (size_t)peerMtu - 3 - AUDIO_HEADER_BYTES;
+  const size_t headerBytes = OLD_APP_FORMAT ? 1 : AUDIO_HEADER_BYTES;  // TEMPORARY: OLD_APP_FORMAT
+  size_t maxBody = (size_t)peerMtu - 3 - headerBytes;
   size_t maxSamples = useRawPcm ? maxBody / 2 : (maxBody - ADPCM_STATE_BYTES) * 2;
   maxSamples &= ~(size_t)1;  // even, so ADPCM never has a half-filled last byte
   size_t packetsPerFrame = (samples + maxSamples - 1) / maxSamples;
@@ -515,14 +583,14 @@ bool sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
     if (n > samplesPerPacket) n = samplesPerPacket;
 
     audioPacket[0] = audioSeq++;
-    size_t len = AUDIO_HEADER_BYTES;
+    size_t len = headerBytes;
     if (useRawPcm) {
       audioPacket[1] = CODEC_PCM;
-      memcpy(audioPacket + len, pcm + offset, n * sizeof(int16_t));  // the S3 is little-endian
+      memcpy(audioPacket + len, pcm + offset, n * sizeof(int16_t));  // S3 and C3 are little-endian
       len += n * sizeof(int16_t);
     } else {
       // Each packet starts with the encoder state for its first sample.
-      audioPacket[1] = CODEC_ADPCM;
+      if (!OLD_APP_FORMAT) audioPacket[1] = CODEC_ADPCM;  // TEMPORARY: OLD_APP_FORMAT
       audioPacket[len++] = (uint8_t)adpcmIndex;
       audioPacket[len++] = (uint8_t)(adpcmPredictor & 0xFF);
       audioPacket[len++] = (uint8_t)((adpcmPredictor >> 8) & 0xFF);
@@ -540,7 +608,7 @@ bool sendAudioFrame(uint32_t frameIndex, const int16_t* pcm, size_t samples) {
   return lost;
 }
 
-// This is where the caption will be drawn on the display.
+// Shows the newest caption from the phone on the OLED and Serial.
 void showCaptionIfChanged() {
   if (!captionDirty) return;
 
@@ -551,6 +619,7 @@ void showCaptionIfChanged() {
   captionDirty = false;
   portEXIT_CRITICAL(&captionMux);
 
+  drawCaption(captionOut);
   Serial.printf("[CAPTION%s] %s\n", (flags & 1) ? " final" : "", captionOut);
 }
 
@@ -653,12 +722,121 @@ void printLevel() {
   packetsThisSecond = 0;
 }
 
+// ---------------- Display ----------------
+// The oled object is declared with the pins; its address is set once the screen is found.
+bool oledFound = false;
+
+// Adds a wrapped line, keeping only the newest OLED_MAX_LINES.
+void pushLine(String* lines, int& count, const String& line) {
+  if (count < OLED_MAX_LINES) {
+    lines[count++] = line;
+    return;
+  }
+  for (int i = 1; i < OLED_MAX_LINES; i++) lines[i - 1] = lines[i];
+  lines[OLED_MAX_LINES - 1] = line;
+}
+
+// Word-wraps the caption and shows its last lines, so the newest words are visible.
+void drawCaption(const char* text) {
+  if (!oledFound) return;
+
+  String lines[OLED_MAX_LINES];
+  int count = 0;
+  String line;
+  const char* p = text;
+  while (*p) {
+    while (*p == ' ') p++;
+    const char* start = p;
+    while (*p && *p != ' ') p++;
+    if (p == start) break;
+    String word;
+    word.concat(start, p - start);
+
+    String candidate = line.length() ? line + " " + word : word;
+    if (line.length() && oled.getUTF8Width(candidate.c_str()) > OLED_WIDTH) {
+      pushLine(lines, count, line);
+      line = word;  // a word wider than the screen is clipped on its own line
+    } else {
+      line = candidate;
+    }
+  }
+  if (line.length()) pushLine(lines, count, line);
+
+  oled.clearBuffer();
+  for (int i = 0; i < count; i++) oled.drawUTF8(0, i * OLED_LINE_HEIGHT, lines[i].c_str());
+  oled.sendBuffer();  // ~25 ms at 400 kHz
+}
+
+// Holds a pin LOW at the strongest drive, to stand in for a GND pin.
+void driveLow(uint8_t pin) {
+  pinMode(pin, OUTPUT);
+  gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
+  digitalWrite(pin, LOW);
+}
+
+// Powers the OLED through its GPIO ground, finds it on I2C, and starts it.
+void setupOled() {
+  if (OLED_GND >= 0) driveLow(OLED_GND);
+  delay(OLED_POWER_UP_MS);
+
+  Wire.begin(OLED_SDA, OLED_SCL, OLED_I2C_HZ);
+  for (uint8_t addr : { 0x3C, 0x3D }) {  // the two addresses SSD1306 modules use
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      oledFound = true;
+      Serial.printf("[OLED] found at 0x%02X\n", addr);
+      oled.setI2CAddress(addr << 1);  // U8g2 takes the 8-bit form
+      oled.setBusClock(OLED_I2C_HZ);
+      oled.begin();
+      if (OLED_MIRROR) oled.setDisplayRotation(U8G2_MIRROR);
+      oled.setFont(OLED_FONT);
+      oled.setFontPosTop();
+      drawCaption("Augment Glasses ready");
+      return;
+    }
+  }
+  Serial.printf("[OLED] NOT FOUND at SCL GPIO %d, SDA GPIO %d: check its wiring and power\n",
+                OLED_SCL, OLED_SDA);
+}
+
+// ===== TEMPORARY DEMO (remove with DEMO_RANDOM_WORDS) =====
+const char* const DEMO_WORDS[] = {
+  "hello", "how", "are", "you", "today", "these", "glasses", "show", "live", "captions",
+  "for", "my", "dad", "it", "works", "great", "nice", "to", "meet", "you", "what",
+  "time", "is", "dinner", "see", "you", "soon", "thanks",
+};
+
+void runDemo() {
+  static unsigned long lastDemo = 0;
+  static String demoText;
+  if (!DEMO_RANDOM_WORDS || audioSubscribed() || millis() - lastDemo < DEMO_INTERVAL_MS) return;
+  lastDemo = millis();
+
+  int words = 2 + random(3);  // 2-4 words
+  for (int i = 0; i < words; i++) {
+    demoText += DEMO_WORDS[random(sizeof(DEMO_WORDS) / sizeof(DEMO_WORDS[0]))];
+    demoText += ' ';
+  }
+  if (demoText.length() > 160) {  // keep it short; only the last lines are shown anyway
+    int cut = demoText.indexOf(' ', demoText.length() - 120);
+    demoText = demoText.substring(cut + 1);
+  }
+  drawCaption(demoText.c_str());
+}
+// ===== END TEMPORARY DEMO =====
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  // Native USB: wait up to 3 s for the Serial Monitor so the startup lines aren't lost.
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 3000) delay(10);
+  delay(100);
   Serial.printf("Augment-Glasses mic: %u Hz, 16-bit mono, %u ms frames, gain %+.0f dB, %s\n",
                 (unsigned)SAMPLE_RATE, (unsigned)FRAME_MS, MIC_GAIN_DB,
                 PREFER_RAW_PCM ? "raw PCM, ADPCM if the link struggles" : "IMA ADPCM");
+
+  driveLow(MIC_LR);  // before the mic starts, so it comes up on the left channel
+  setupOled();
 
   gainLinear = powf(10.0f, MIC_GAIN_DB / 20.0f);
 
@@ -675,8 +853,12 @@ void setup() {
 
   setupBle();
 
+#if CONFIG_FREERTOS_UNICORE
+  xTaskCreate(micTask, "mic", 4096, NULL, 5, NULL);  // the C3 has one core
+#else
   // Core 1 with loop(); core 0 is left for the BLE stack.
   xTaskCreatePinnedToCore(micTask, "mic", 4096, NULL, 5, NULL, 1);
+#endif
   lastLevelPrint = millis();
 }
 
@@ -686,10 +868,12 @@ void loop() {
   while (xQueueReceive(audioQueue, &loopFrame, pdMS_TO_TICKS(50)) == pdTRUE) {
     handleAudioFrame(loopFrame);
     showCaptionIfChanged();
+    runDemo();  // TEMPORARY DEMO
     if (millis() - lastLevelPrint >= 1000) break;
   }
 
   showCaptionIfChanged();
+  runDemo();  // TEMPORARY DEMO
 
   if (millis() - lastLevelPrint >= 1000) {
     lastLevelPrint = millis();
